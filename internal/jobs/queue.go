@@ -1,14 +1,11 @@
-// Package jobs contains the concurrency-safe, deliberately in-memory Phase 1
-// reference implementation of a leased job queue.
+// Package jobs implements the reference in-memory leased queue and shared job contracts.
 package jobs
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -113,6 +110,9 @@ func generateID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+// NewID generates a cryptographically random, collision-resistant identifier.
+func NewID() (string, error) { return generateID() }
+
 func clone(job Job) Job {
 	job.Payload = slices.Clone(job.Payload)
 	job.Result = slices.Clone(job.Result)
@@ -124,26 +124,11 @@ func clone(job Job) Job {
 }
 
 func (q *Queue) Enqueue(req Submission, idempotencyKey string) (Job, bool, error) {
-	if req.Kind == "" || !json.Valid(req.Payload) || len(req.Payload) > 64*1024 || len(idempotencyKey) > 128 {
-		return Job{}, false, ErrInvalid
-	}
-	if req.MaxAttempts == 0 {
-		req.MaxAttempts = 3
-	}
-	if req.MaxAttempts < 1 || req.MaxAttempts > 8 {
-		return Job{}, false, ErrInvalid
-	}
-	// JSON re-encoding canonicalizes object keys; inconsequential whitespace and
-	// key ordering must not make idempotent retries appear different.
-	var normalized any
-	if err := json.Unmarshal(req.Payload, &normalized); err != nil {
-		return Job{}, false, ErrInvalid
-	}
-	canonical, err := json.Marshal(normalized)
+	canonical, digest, attempts, err := NormalizeSubmission(req, idempotencyKey)
 	if err != nil {
 		return Job{}, false, err
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s", req.Kind, req.MaxAttempts, canonical)))
+	req.MaxAttempts = attempts
 
 	q.mu.Lock()
 	defer q.mu.Unlock()

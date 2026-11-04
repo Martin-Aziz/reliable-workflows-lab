@@ -13,7 +13,7 @@ import (
 type Handler func(context.Context, json.RawMessage) (json.RawMessage, error)
 
 type Processor struct {
-	Queue       *Queue
+	Store       Store
 	Handlers    map[string]Handler
 	Logger      *slog.Logger
 	TaskTimeout time.Duration
@@ -48,7 +48,7 @@ func DefaultHandlers() map[string]Handler {
 }
 
 func (p *Processor) ProcessOne(ctx context.Context, workerID string) (bool, error) {
-	lease, ok, err := p.Queue.Claim(workerID)
+	lease, ok, err := p.Store.Claim(ctx, workerID)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -69,7 +69,7 @@ func (p *Processor) ProcessOne(ctx context.Context, workerID string) (bool, erro
 		if p.Logger != nil {
 			p.Logger.Warn("job failed", "job_id", lease.Job.ID, "kind", lease.Job.Kind, "attempt", lease.Job.Attempts, "error", handlerErr)
 		}
-		return true, p.Queue.Fail(lease.Job.ID, lease.Token, handlerErr)
+		return true, p.Store.Fail(ctx, lease.Job.ID, lease.Token, handlerErr)
 	}
 	if len(result) == 0 {
 		result = json.RawMessage(`null`)
@@ -78,9 +78,9 @@ func (p *Processor) ProcessOne(ctx context.Context, workerID string) (bool, erro
 		if p.Logger != nil {
 			p.Logger.Warn("handler returned invalid result", "job_id", lease.Job.ID)
 		}
-		return true, p.Queue.Fail(lease.Job.ID, lease.Token, errors.New("invalid handler result"))
+		return true, p.Store.Fail(ctx, lease.Job.ID, lease.Token, errors.New("invalid handler result"))
 	}
-	err = p.Queue.Complete(lease.Job.ID, lease.Token, result)
+	err = p.Store.Complete(ctx, lease.Job.ID, lease.Token, result)
 	if err == nil && p.Logger != nil {
 		p.Logger.Info("job completed", "job_id", lease.Job.ID, "kind", lease.Job.Kind, "attempt", lease.Job.Attempts)
 	}

@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +26,7 @@ func request(t *testing.T, h http.Handler, method, path, body, key string) *http
 
 func TestCreateGetListAndIdempotency(t *testing.T) {
 	q := jobs.NewQueue()
-	h := (&API{Queue: q}).Handler()
+	h := (&API{Store: jobs.MemoryStore{Queue: q}}).Handler()
 	body := `{"kind":"echo","payload":{"name":"test"}}`
 	a := request(t, h, "POST", "/v1/jobs", body, "id-1")
 	if a.Code != http.StatusCreated {
@@ -65,7 +67,7 @@ func TestCreateGetListAndIdempotency(t *testing.T) {
 }
 
 func TestRejectsInvalidInputs(t *testing.T) {
-	h := (&API{Queue: jobs.NewQueue()}).Handler()
+	h := (&API{Store: jobs.MemoryStore{Queue: jobs.NewQueue()}}).Handler()
 	cases := []struct {
 		method, path, body string
 		code               int
@@ -85,5 +87,19 @@ func TestRejectsInvalidInputs(t *testing.T) {
 		if resp.Code != c.code {
 			t.Errorf("case %d status %d want %d", i, resp.Code, c.code)
 		}
+	}
+}
+
+type unavailableStore struct{ jobs.Store }
+
+func (unavailableStore) Ready(context.Context) error { return errors.New("unavailable") }
+
+func TestReadinessFailureDoesNotDisableLiveness(t *testing.T) {
+	h := (&API{Store: unavailableStore{Store: jobs.MemoryStore{Queue: jobs.NewQueue()}}}).Handler()
+	if got := request(t, h, "GET", "/readyz", "", ""); got.Code != 503 {
+		t.Fatalf("readiness=%d", got.Code)
+	}
+	if got := request(t, h, "GET", "/healthz", "", ""); got.Code != 200 {
+		t.Fatalf("liveness=%d", got.Code)
 	}
 }

@@ -1,146 +1,128 @@
 # Reliable Workflows Lab
 
-**A reproducible backend-engineering portfolio project about job queues, concurrency, retries, and failure recovery.**
+**A transparent Go backend-engineering portfolio project about transactional queues, concurrency, retries, and crash recovery.**
 
-> **Status: Phase 1 prototype, not production-ready.** The API and worker pool run in one process and store jobs in memory. Restarting the process **loses all jobs and idempotency keys**. PostgreSQL durability is explicitly reserved for Phase 2.
+> **Status: Phase 2 implementation under review.** The Phase 1 in-memory engine is locally verified. An optional PostgreSQL backend has been implemented, but **its real-database integration suite still needs execution** before durability is certified. This is not a production service.
 
-## What works today
+## Features
 
-- Submit `echo`, `sum`, or deliberately failing demo jobs over HTTP.
-- Replay an `Idempotency-Key` without scheduling a duplicate; reject conflicting reuse with HTTP 409.
-- Atomically lease a due job to one worker at a time; protect completion against stale lease tokens.
-- Apply bounded retries with exponential backoff; move exhausted jobs to `dead`.
-- Recover expired worker leases (at-least-once *attempt* semantics within one process lifetime).
-- Inspect jobs, recent submissions, and state totals through a JSON API.
-- Test concurrent claims, idempotent submission races, lease expiration, stale acknowledgment, retries, and malformed inputs using only Go's standard library.
+- HTTP endpoint to submit `echo`, `sum`, or intentionally failing demo jobs. No execution of user-supplied code or shell commands.
+- Atomic idempotent submissions: identical key/request replays the same job, conflicting key reuse returns HTTP 409.
+- Concurrency-safe worker leasing with unpredictable ownership tokens and stale-completion fencing.
+- Retry backoff, configurable max attempts (1–8), and terminal `dead` state.
+- **Two storage modes:** in-memory for fast local experiments; PostgreSQL for persisted jobs and cross-process workers.
+- PostgreSQL jobs, idempotency fingerprints, and per-attempt outcome records; `FOR UPDATE SKIP LOCKED` job claims.
+- `/healthz` liveness, `/readyz` storage readiness, and `/v1/stats` counts.
 
-## Architecture (Phase 1)
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[CLI / HTTP client] --> B[HTTP REST API]
-    B --> C[Concurrency-safe in-memory queue]
-    C --> W1[Worker 1]
-    C --> W2[Worker N]
-    W1 --> H[Registered task handlers]
-    W2 --> H
-    H --> C
+  Client[REST Client] --> API[Go HTTP API]
+  API --> Store{Storage interface}
+  Store --> Memory[Memory / Phase 1]
+  Store --> DB[(PostgreSQL / Phase 2)]
+  DB --> WorkerA[Worker A / Process A]
+  DB --> WorkerB[Worker B / Process B]
+  WorkerA --> Handlers[Task handlers]
+  WorkerB --> Handlers
 ```
 
-Go's `sync.Mutex` serializes state transitions in Phase 1. Worker lease tokens fence out stale completions. The design is intentionally independent of a particular queue broker; [ADR 0001](docs/ADR-0001-queue-semantics.md) explains the trade-offs.
+The real execution path is *worker -> Store.Claim -> handler -> Store.Complete/Fail*. Workers do not hold SQL transactions open while executing handlers. See [ADR 0002](docs/ADR-0002-postgres-durability.md).
 
-### Job lifecycle
+## Quick start — in-memory mode
 
-```text
-  submit -> queued -> running -> succeeded
-               ^        |
-               |        +---- failure / lease expiry -> queued (after backoff)
-               |                                     or -> dead (attempts exhausted)
-               +-------------------------------------+
-```
-
-The implementation provides at-least-once **execution attempts** during a running process, not exactly-once side effects. A worker can perform an external action and lose its lease before acknowledging completion. Consumers must make external effects idempotent. See [limitations](#limitations-and-security).
-
-## Quick start
-
-Install a supported Go toolchain (currently Go 1.27.x recommended; the source also compiles with Go 1.23). No database, Docker, or API keys are needed for this first phase.
+Requires Go 1.23 or newer. The server binds to loopback by default.
 
 ```bash
+go mod download
 go run ./cmd/server
-# In a second terminal:
-curl -s http://127.0.0.1:8080/healthz
+# In another terminal:
+curl -s http://127.0.0.1:8080/readyz
 ```
 
-Create an echo job:
+In this mode, state is lost after a restart.
+
+## PostgreSQL mode (local Docker)
+
+```bash
+docker compose up -d postgres
+export DATABASE_URL='postgres://rwl:rwl_dev_only@127.0.0.1:5432/rwl?sslmode=disable'
+go run ./cmd/server
+```
+
+**These are example development credentials only.** Do not copy them into an Internet-accessible deployment. The server creates the initial schema when it starts; it exits if the database cannot be reached or migrations fail. Compose binds PostgreSQL to loopback and keeps its data in a named Docker volume.
+
+A second process can use the same `DATABASE_URL` to share jobs, provided it binds to a different HTTP address:
+
+```bash
+HTTP_ADDR=127.0.0.1:8081 WORKERS=2 go run ./cmd/server
+```
+
+A durable restart exercise is: start with `WORKERS=0` (API only), submit a job with an idempotency key, stop the process, and restart with `WORKERS=2` and the same `DATABASE_URL`. Verify the original job completes and reusing the key returns the same ID. A stopped worker's in-flight lease is recovered after its expiry and the retry delay. **The external PostgreSQL restart exercise remains to be certified.**
+
+## API exercise
 
 ```bash
 curl -i -X POST http://127.0.0.1:8080/v1/jobs \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: demo-001' \
-  -d '{"kind":"echo","payload":{"message":"hello"}}'
+  -d '{"kind":"sum","payload":{"numbers":[4,5]},"max_attempts":3}'
 ```
 
-Submit the same request with the same key: the API returns **200** with the original job instead of creating a new one. A new job returns **201** and a `Location: /v1/jobs/<id>` response header. Reusing the key with a different request returns **409**.
+The first submission returns **201** with a `Location` header. Repeating the exact request with the same key returns **200** and the same ID. Reusing the key with different data returns **409**.
 
-Create a summation job:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/v1/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"kind":"sum","payload":{"numbers":[1,2,3.25]},"max_attempts":3}'
-```
-
-Wait briefly, then inspect the returned ID:
-
-```bash
-curl -s http://127.0.0.1:8080/v1/jobs/YOUR_JOB_ID
-curl -s 'http://127.0.0.1:8080/v1/jobs?limit=10'
-curl -s http://127.0.0.1:8080/v1/stats
-```
-
-To demonstrate retry and dead-letter behavior, submit `{"kind":"fail","payload":{},"max_attempts":2}` and inspect the job after a few seconds.
-
-## HTTP API
-
-| Method | Path | Result |
+| Method | Path | Meaning |
 |---|---|---|
-| `GET` | `/healthz` | Process health, not durability |
-| `POST` | `/v1/jobs` | Create job (201), replay (200), or conflict (409) |
-| `GET` | `/v1/jobs/{id}` | Current job state (200) or missing (404) |
-| `GET` | `/v1/jobs?limit=20` | Up to 100 newest jobs |
-| `GET` | `/v1/stats` | Counts by job state |
+| `GET` | `/healthz` | Process liveness (not DB health) |
+| `GET` | `/readyz` | Storage readiness (503 when unavailable) |
+| `POST` | `/v1/jobs` | Create/replay/conflict |
+| `GET` | `/v1/jobs/{id}` | State, result, attempts |
+| `GET` | `/v1/jobs?limit=20` | Up to 100 recent jobs |
+| `GET` | `/v1/stats` | State counts |
 
-Job request shape:
-
-```json
-{
-  "kind": "echo",
-  "payload": {"message": "hello"},
-  "max_attempts": 3
-}
-```
-
-`max_attempts` defaults to 3 (range 1–8). Payloads are capped at 64 KiB. This is a demo execution environment: **only three registered tasks are accepted**, and it never executes user-supplied shell commands or code.
-
-## Verification
+## Tests
 
 ```bash
 go test ./...
 go test -race -count=1 ./...
 go vet ./...
-go test -cover ./...
+# With a running server in another terminal:
+bash scripts/smoke.sh
 ```
 
-A manual end-to-end exercise is available via `bash scripts/smoke.sh`. The race detector and test suite were run in the authoring environment. There is no claim yet of cloud deployment, persistence under restart, or load-tested throughput.
+For **real PostgreSQL integration tests**, create a separate database whose name ends in `_test` and set `TEST_DATABASE_URL`; the test suite creates and drops a uniquely named schema, never truncates the application database, and skips when no test URL is provided.
 
-## Repo layout
-
-```text
-cmd/server/main.go           HTTP server, workers, graceful signal handling
-internal/httpapi/api.go      REST API, bounded request parsing
-internal/jobs/queue.go       State machine, leases, retries, deduplication
-internal/jobs/processor.go   Registered task handlers, worker loops
-internal/**/*_test.go        Race, API, and state-machine tests
-scripts/smoke.sh             End-to-end HTTP smoke test
-docs/ADR-0001-queue-semantics.md
-docs/PHASES.md
-docs/INTERVIEW_GUIDE.md
-docs/PRODUCT_BRIEF.md
+```bash
+# If using the local Compose container, create the test database once:
+docker compose exec -T postgres psql -U rwl -d postgres -c 'CREATE DATABASE rwl_test;'
+export TEST_DATABASE_URL='postgres://rwl:rwl_dev_only@127.0.0.1:5432/rwl_test?sslmode=disable'
+make integration
 ```
 
-## Limitations and security
+The `integration` build tag is intentional: ordinary unit tests need no running PostgreSQL server. A schema teardown runs even when a test fails. Do not set `TEST_DATABASE_URL` to a production database.
 
-- **No persistence:** all state disappears on restart. This is the highest-priority gap.
-- **No authentication, tenant separation, or rate limits.** The HTTP server binds to `127.0.0.1:8080` by default. Do **not** expose this API publicly.
-- **No multi-process coordination:** all concurrency guarantees apply only to this process. Multiple server instances would have independent queues.
-- **No exactly-once side effects:** a worker may run twice after a crash or lease expiration; external consumers need idempotency.
-- **No lease renewal or heartbeat:** tasks exceeding the lease duration can be retried. The default processing timeout is 5s and the lease is 10s.
-- **Unbounded in-memory history:** not suitable for long-running or high-volume production use.
-- **No real DLQ replay workflow, metrics export, distributed tracing, or benchmark claim.** These are upcoming phases.
+## Correctness and limitations
 
-## Roadmap and interview narrative
+- **At-least-once attempts, not exactly-once effects.** A worker can perform an external side effect and crash before its completion is acknowledged. Integrations must implement idempotent effects.
+- An expired lease may still appear `running` until a worker reaps it. The API gives no strict FIFO guarantee.
+- The PostgreSQL backend coordinates independent server processes, but has no automatic lease heartbeat. The built-in task timeout is 5s and lease deadline 10s.
+- Jobs, idempotency keys, and attempt records currently have no TTL or retention job.
+- There is **no authentication, tenant separation, or public API hardening**. Do not expose the server publicly.
+- Real PostgreSQL concurrency, failure recovery and migration behavior have not yet been executed in this environment; integration tests exist for external verification.
+- The demo's in-memory state is **not** automatically copied into PostgreSQL when switching modes.
 
-See [PHASES.md](docs/PHASES.md) for milestones and acceptance criteria, and [INTERVIEW_GUIDE.md](docs/INTERVIEW_GUIDE.md) for engineering decisions, failure modes, and questions to rehearse. This repository is intentionally structured to demonstrate **software fundamentals before infrastructure complexity**.
+## Source navigation
+
+| Path | Purpose |
+|---|---|
+| `cmd/server/main.go` | Startup, DB connection, workers, graceful shutdown |
+| `internal/jobs/` | Shared contracts, memory engine, task execution |
+| `internal/postgres/` | SQL store, migration, PostgreSQL integration tests |
+| `internal/httpapi/` | HTTP API and readiness semantics |
+| `compose.yaml` | Local PostgreSQL 16 development environment |
+| `docs/ADR-0002-postgres-durability.md` | Transactional design and explicit non-guarantees |
+| `docs/PHASES.md` | Exit gates and current certification status |
 
 ## License
 

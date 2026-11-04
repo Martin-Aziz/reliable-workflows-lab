@@ -1,53 +1,33 @@
 # Implementation phases and acceptance gates
 
-This project is a standalone, open-source portfolio artifact, not a commercial product. Complete and verify each phase before extending scope. The statements below are plans unless explicitly marked complete.
+This is a portfolio-oriented reference system, not production software. Implement and verify each phase with explicit evidence; a merged PR is not proof that external integration tests passed.
 
-## Phase 1 — Minimal correct execution core — IMPLEMENTED, local verification
+## Phase 1 — Minimal correct execution core — COMPLETE
 
-Deliverables:
-- Go HTTP service and explicit demo task registry.
-- Mutex-protected in-memory job state machine.
-- Atomic idempotent submission with conflicting-key rejection.
-- Concurrent leased claims, stale-token fencing, bounded retries and backoff.
-- `GET` endpoints for job status, listing, state counts; health probe.
-- Unit/race tests and reproducible manual smoke test.
+Go HTTP service, in-memory leased queue, idempotency, concurrent workers, retries, fencing, deterministic unit tests, and race detection.
 
-Exit gate: `go test ./...`, `go test -race ./...`, `go vet ./...`, and HTTP smoke pass; no false claims of durability.
+## Phase 2 — PostgreSQL durability — IN REVIEW / REQUIRES POSTGRESQL CERTIFICATION
 
-## Phase 2 — PostgreSQL durability — NOT STARTED
+- [x] Shared storage interface with a separate in-memory backend.
+- [x] Schema migration for jobs, idempotency keys, and attempt history.
+- [x] Transactional idempotent enqueue with unique-key fingerprint comparison.
+- [x] `SKIP LOCKED` claims and atomic creation of attempt records.
+- [x] SQL failure, success, lease expiry, and retry transitions with token fencing.
+- [x] PostgreSQL integration tests authored (concurrency, restart, idempotency, expiry, stale ack).
+- [x] Liveness and DB-backed readiness endpoints, local Compose setup.
+- [ ] Execute real PostgreSQL integration tests in an environment with a running PostgreSQL server.
+- [ ] Run an end-to-end two-process crash/restart certification and document results.
 
-- Migration/schema with jobs, attempt history, unique scoped idempotency keys.
-- Transactional enqueue and idempotency (`INSERT ... ON CONFLICT` with fingerprint matching).
-- Transactional claims with `FOR UPDATE SKIP LOCKED` and a fencing token/version.
-- Worker completion, retry, and dead transitions in SQL transactions.
-- Crash/restart and concurrent-process integration tests (real PostgreSQL, ideally Testcontainers).
-- Explicit database connectivity/readiness checks and failure handling.
-
-Exit gate: restart the API and workers; previously enqueued jobs and deduplication survive; multiple worker processes do not successfully claim the same unexpired lease.
+The current code is ready for review but **does not pass the phase exit gate until real PostgreSQL tests run**.
 
 ## Phase 3 — Execution reliability — NOT STARTED
 
-- Lease heartbeat or deliberate strict task-duration bound, with token-qualified renewals.
-- Cancellation, timeout enforcement, jitter, and configurable retry policies.
-- Dead-letter investigation/replay with a new attempt budget and audited operator action.
-- Optional outbox pattern for safe publication of business events.
+Lease heartbeat/renewal; cancellation; task timeouts; jitter; dead-letter replays; fault injection; audit actions.
 
-Exit gate: deterministic fault-injection suite covering worker crash, lost acknowledgment, delayed handler, and duplicate external effect.
+## Phase 4 — Performance and operations — NOT STARTED
 
-## Phase 4 — Operations and performance — NOT STARTED
+Load tests, p50/p95 latency, Prometheus/OTel, bounded retention, error budgets, security scans, optional minimal CI.
 
-- Structured tracing, Prometheus metrics and dashboards.
-- Benchmarks under measured workload and hardware with p50/p95 latency, claim throughput, error rates, and queue lag.
-- CPU/memory profile and queue cardinality limits.
-- Dependency/security scans and CI with minimum token permissions.
+## Phase 5 — Product and interview narrative — NOT STARTED
 
-Exit gate: reproducible benchmark report with graphs, environment, commands, and interpretation rather than an unsupported performance number.
-
-## Phase 5 — Product/PM narrative — NOT STARTED
-
-- 2–3 developer interviews about queue reliability/operational pain.
-- One-page product brief and documented prioritization decisions.
-- Screenshots/video of planned failures, recovery, and operator observations.
-- Public demo with sanitized data and a short trade-off explainer.
-
-Exit gate: defend technical decisions and user impact in a 10-minute interview walkthrough.
+Developer research, prioritization case study, benchmark report, public demo with synthetic data, and technical interview walkthrough.

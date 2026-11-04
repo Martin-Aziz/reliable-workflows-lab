@@ -10,7 +10,7 @@ import (
 func TestProcessorSuccessAndFailure(t *testing.T) {
 	now, advance := fakeClock()
 	q := NewQueue(WithClock(now), WithRetryBase(time.Second))
-	p := &Processor{Queue: q, Handlers: DefaultHandlers(), TaskTimeout: time.Second}
+	p := &Processor{Store: MemoryStore{Queue: q}, Handlers: DefaultHandlers(), TaskTimeout: time.Second}
 	sum, _, err := q.Enqueue(Submission{Kind: "sum", Payload: json.RawMessage(`{"numbers":[1,2,3.25]}`)}, "")
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestProcessorSuccessAndFailure(t *testing.T) {
 func TestInvalidHandlerResultIsRejected(t *testing.T) {
 	q := NewQueue()
 	j := mustEnqueue(t, q, "custom", 1)
-	p := &Processor{Queue: q, Handlers: map[string]Handler{"custom": func(context.Context, json.RawMessage) (json.RawMessage, error) { return []byte(`{not-json}`), nil }}}
+	p := &Processor{Store: MemoryStore{Queue: q}, Handlers: map[string]Handler{"custom": func(context.Context, json.RawMessage) (json.RawMessage, error) { return []byte(`{not-json}`), nil }}}
 	did, err := p.ProcessOne(context.Background(), "w")
 	if !did || err != nil {
 		t.Fatalf("expected handled invalid result, got %v %v", did, err)
