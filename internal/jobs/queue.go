@@ -18,6 +18,7 @@ const (
 	Running   State = "running"
 	Succeeded State = "succeeded"
 	Dead      State = "dead"
+	Canceled  State = "canceled"
 )
 
 var (
@@ -25,6 +26,7 @@ var (
 	ErrInvalid   = errors.New("invalid job")
 	ErrConflict  = errors.New("idempotency key already used with different request")
 	ErrLeaseLost = errors.New("job lease no longer owned by worker")
+	ErrTerminal  = errors.New("job already in a terminal state")
 )
 
 type Job struct {
@@ -173,6 +175,7 @@ type Stats struct {
 	Running   int `json:"running"`
 	Succeeded int `json:"succeeded"`
 	Dead      int `json:"dead"`
+	Canceled  int `json:"canceled"`
 }
 
 func (q *Queue) Stats() Stats {
@@ -189,6 +192,8 @@ func (q *Queue) Stats() Stats {
 			s.Succeeded++
 		case Dead:
 			s.Dead++
+		case Canceled:
+			s.Canceled++
 		}
 	}
 	return s
@@ -315,4 +320,50 @@ func (q *Queue) Fail(id, token string, cause error) error {
 		j.AvailableAt = now.Add(q.delay(j.Attempts))
 	}
 	return nil
+}
+
+
+// Renew extends only a live, token-owned lease. A worker that lost its lease
+// cannot recover ownership by renewing after expiry.
+func (q *Queue) Renew(jobID, token string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	j, ok := q.jobs[jobID]
+	if !ok {
+		return ErrNotFound
+	}
+	if err := q.verifyLease(j, token); err != nil {
+		return err
+	}
+	now := q.now()
+	until := now.Add(q.leaseDuration)
+	j.LeaseUntil = &until
+	j.UpdatedAt = now
+	return nil
+}
+
+// Cancel is a logical stop. It fences in-flight acknowledgements immediately;
+// it does not forcibly terminate a handler already running external code.
+func (q *Queue) Cancel(jobID string) (Job, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	j, ok := q.jobs[jobID]
+	if !ok {
+		return Job{}, ErrNotFound
+	}
+	switch j.State {
+	case Canceled:
+		return clone(*j), nil
+	case Succeeded, Dead:
+		return Job{}, ErrTerminal
+	case Queued, Running:
+		j.State = Canceled
+		j.WorkerID = ""
+		j.LeaseUntil = nil
+		j.leaseToken = ""
+		j.UpdatedAt = q.now()
+		return clone(*j), nil
+	default:
+		return Job{}, ErrInvalid
+	}
 }

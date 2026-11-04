@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"io/fs"
+	"sort"
 	"errors"
 	"fmt"
 	"time"
@@ -16,7 +18,7 @@ import (
 	"github.com/Martin-Aziz/reliable-workflows-lab/internal/jobs"
 )
 
-//go:embed migrations/001_init.sql
+//go:embed migrations/*.sql
 var migrations embed.FS
 
 // Store owns no database connections; the caller owns db and must close it.
@@ -53,15 +55,36 @@ func New(db *sql.DB, options ...Option) *Store {
 
 func (s *Store) Ready(ctx context.Context) error { return s.db.PingContext(ctx) }
 
-// Migrate initializes the schema. Use a dedicated database or schema, and
-// manage rolling upgrades explicitly before using multiple versions together.
+// Migrate tracks additive migrations under a transaction-scoped advisory lock.
+// Migration 001 is idempotent, including for previously initialized databases.
 func (s *Store) Migrate(ctx context.Context) error {
-	ddl, err := migrations.ReadFile("migrations/001_init.sql")
-	if err != nil {
-		return err
+	paths, err := fs.Glob(migrations, "migrations/*.sql")
+	if err != nil { return err }
+	sort.Strings(paths)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil { return err }
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(1544192026)`); err != nil { return err }
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
+		version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`); err != nil { return err }
+	for _, name := range paths {
+		var applied bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM workflow_schema_migrations WHERE version=$1)`, name).Scan(&applied); err != nil {
+			return err
+		}
+		if applied { continue }
+		ddl, readErr := migrations.ReadFile(name)
+		if readErr != nil { return readErr }
+		if _, err = tx.ExecContext(ctx, string(ddl)); err != nil {
+			return fmt.Errorf("migration %s: %w", name, err)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO workflow_schema_migrations(version) VALUES ($1)`, name); err != nil {
+			return err
+		}
 	}
-	_, err = s.db.ExecContext(ctx, string(ddl))
-	return err
+	return tx.Commit()
 }
 
 const columns = `id,kind,payload::text,state,attempts,max_attempts,available_at,lease_until,worker_id,result::text,last_error,created_at,updated_at`
@@ -194,8 +217,9 @@ func (s *Store) Stats(ctx context.Context) (jobs.Stats, error) {
         COUNT(*) FILTER (WHERE state='queued')::int,
         COUNT(*) FILTER (WHERE state='running')::int,
         COUNT(*) FILTER (WHERE state='succeeded')::int,
-        COUNT(*) FILTER (WHERE state='dead')::int FROM workflow_jobs`).Scan(
-		&stats.Total, &stats.Queued, &stats.Running, &stats.Succeeded, &stats.Dead)
+        COUNT(*) FILTER (WHERE state='dead')::int,
+        COUNT(*) FILTER (WHERE state='canceled')::int FROM workflow_jobs`).Scan(
+		&stats.Total, &stats.Queued, &stats.Running, &stats.Succeeded, &stats.Dead, &stats.Canceled)
 	return stats, err
 }
 
@@ -318,6 +342,51 @@ func (s *Store) finalizeResult(ctx context.Context, jobID string, result sql.Res
 		return err
 	}
 	return jobs.ErrLeaseLost
+}
+
+// Renew extends a live, token-owned lease. Expired leases cannot be resurrected.
+func (s *Store) Renew(ctx context.Context, jobID, token string) error {
+	if token == "" { return jobs.ErrLeaseLost }
+	r, err := s.db.ExecContext(ctx, `UPDATE workflow_jobs
+		SET lease_until=now()+($3::float8*interval '1 second'),updated_at=now()
+		WHERE id=$1 AND state='running' AND lease_token=$2 AND lease_until>now()`,
+		jobID, token, s.leaseDuration.Seconds())
+	return s.finalizeResult(ctx, jobID, r, err)
+}
+
+// Cancel atomically fences active work and marks a job terminal. It is idempotent
+// for canceled jobs; succeeded and dead jobs cannot be canceled retroactively.
+func (s *Store) Cancel(ctx context.Context, jobID string) (jobs.Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil { return jobs.Job{}, err }
+	defer tx.Rollback()
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM workflow_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) { return jobs.Job{}, jobs.ErrNotFound }
+	if err != nil { return jobs.Job{}, err }
+	switch jobs.State(state) {
+	case jobs.Succeeded, jobs.Dead:
+		return jobs.Job{}, jobs.ErrTerminal
+	case jobs.Canceled:
+		// Replay does not mutate state.
+	case jobs.Queued, jobs.Running:
+		if _, err = tx.ExecContext(ctx, `UPDATE workflow_jobs
+			SET state='canceled',worker_id=NULL,lease_token=NULL,lease_until=NULL,updated_at=now()
+			WHERE id=$1`, jobID); err != nil {
+			return jobs.Job{}, err
+		}
+		if state == string(jobs.Running) {
+			if _, err = tx.ExecContext(ctx, `UPDATE workflow_attempts
+				SET outcome='canceled',finished_at=now()
+				WHERE job_id=$1 AND outcome IS NULL`, jobID); err != nil {
+				return jobs.Job{}, err
+			}
+		}
+	default:
+		return jobs.Job{}, jobs.ErrInvalid
+	}
+	if err = tx.Commit(); err != nil { return jobs.Job{}, err }
+	return s.Get(ctx, jobID)
 }
 
 var _ jobs.Store = (*Store)(nil)

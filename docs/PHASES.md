@@ -6,7 +6,7 @@ This is a portfolio-oriented reference system, not production software. Implemen
 
 Go HTTP service, in-memory leased queue, idempotency, concurrent workers, retries, fencing, deterministic unit tests, and race detection.
 
-## Phase 2 — PostgreSQL durability — IN REVIEW / REQUIRES POSTGRESQL CERTIFICATION
+## Phase 2 — PostgreSQL durability — MERGED / STILL REQUIRES POSTGRESQL CERTIFICATION
 
 - [x] Shared storage interface with a separate in-memory backend.
 - [x] Schema migration for jobs, idempotency keys, and attempt history.
@@ -18,11 +18,18 @@ Go HTTP service, in-memory leased queue, idempotency, concurrent workers, retrie
 - [ ] Execute real PostgreSQL integration tests in an environment with a running PostgreSQL server.
 - [ ] Run an end-to-end two-process crash/restart certification and document results.
 
-The current code is ready for review but **does not pass the phase exit gate until real PostgreSQL tests run**.
+Phase 2 was merged, but **its certification gate remains open until real PostgreSQL tests run**.
 
-## Phase 3 — Execution reliability — NOT STARTED
+## Phase 3 — Execution reliability — IN PROGRESS
 
-Lease heartbeat/renewal; cancellation; task timeouts; jitter; dead-letter replays; fault injection; audit actions.
+- [x] Token-fenced lease renewal in both storage backends.
+- [x] Worker heartbeat and explicit task timeout handling.
+- [x] Logical cancellation with terminal state and attempt outcome.
+- [x] Tracked, serialized database migrations for Phase 2 adoption and Phase 3 schema.
+- [ ] Real PostgreSQL integration certification and restart / crash tests.
+- [ ] Dead-letter replay, retry jitter, and audited operator actions.
+
+Cancellation fences completion but cannot force-stop code that ignores context. No authentication is present: keep API bound to loopback.
 
 ## Phase 4 — Performance and operations — NOT STARTED
 
