@@ -1,0 +1,20 @@
+# Local development only. Do not expose the demo API or database publicly.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rwl
+      POSTGRES_PASSWORD: rwl_dev_only
+      POSTGRES_DB: rwl
+    ports:
+      - '127.0.0.1:5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U rwl -d rwl']
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - rwl_postgres:/var/lib/postgresql/data
+
+volumes:
+  rwl_postgres:

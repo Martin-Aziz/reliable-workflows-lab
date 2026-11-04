@@ -1,4 +1,4 @@
-.PHONY: run test race vet cover build smoke
+.PHONY: run test race vet cover build smoke integration
 run:
 	go run ./cmd/server
 
@@ -20,3 +20,8 @@ build:
 
 smoke:
 	bash scripts/smoke.sh
+
+# Requires a dedicated database ending in _test (for example rwl_test).
+integration:
+	@test -n "$(TEST_DATABASE_URL)" || (echo "Set TEST_DATABASE_URL to a dedicated *_test database URL" >&2; exit 1)
+	go test -tags=integration -count=1 -v ./internal/postgres
