@@ -17,6 +17,9 @@ type Processor struct {
 	Handlers    map[string]Handler
 	Logger      *slog.Logger
 	TaskTimeout time.Duration
+	// LeaseRenewInterval controls the heartbeat cadence (default 2s). Set it
+	// shorter than the store lease duration to retain ownership on long tasks.
+	LeaseRenewInterval time.Duration
 }
 
 func DefaultHandlers() map[string]Handler {
@@ -62,9 +65,55 @@ func (p *Processor) ProcessOne(ctx context.Context, workerID string) (bool, erro
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	taskCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	taskCtx, cancelTask := context.WithTimeout(ctx, timeout)
+	defer cancelTask()
+	interval := p.LeaseRenewInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	beatCtx, stopBeat := context.WithCancel(taskCtx)
+	beatDone := make(chan error, 1)
+	go func() {
+		defer close(beatDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-beatCtx.Done():
+				return
+			case <-ticker.C:
+				if beatCtx.Err() != nil {
+					return
+				}
+				renewCtx, renewCancel := context.WithTimeout(beatCtx, 2*time.Second)
+				err := p.Store.Renew(renewCtx, lease.Job.ID, lease.Token)
+				renewCancel()
+				if err != nil {
+					if beatCtx.Err() != nil {
+						// Handler finished or timed out: a canceled renewal
+						// request must not masquerade as lease loss.
+						return
+					}
+					beatDone <- err
+					cancelTask() // cooperative handlers observe lease loss
+					return
+				}
+			}
+		}
+	}()
 	result, handlerErr := handler(taskCtx, lease.Job.Payload)
+	stopBeat()
+	// Wait for an in-flight heartbeat before acknowledging an attempt.
+	if heartbeatErr, failed := <-beatDone; failed {
+		return true, fmt.Errorf("lease heartbeat failed: %w", heartbeatErr)
+	}
+	if err := taskCtx.Err(); err != nil {
+		if ctx.Err() != nil {
+			// Shutdown: let the lease expire; retry ownership is durable.
+			return true, ctx.Err()
+		}
+		return true, p.Store.Fail(ctx, lease.Job.ID, lease.Token, err)
+	}
 	if handlerErr != nil {
 		if p.Logger != nil {
 			p.Logger.Warn("job failed", "job_id", lease.Job.ID, "kind", lease.Job.Kind, "attempt", lease.Job.Attempts, "error", handlerErr)

@@ -127,3 +127,33 @@ The `integration` build tag is intentional: ordinary unit tests need no running 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Phase 3 preview: heartbeat and logical cancellation
+
+**Experimental until real PostgreSQL certification.** Keep the API on
+`127.0.0.1`: this development server does not implement authentication.
+
+Use `POST /v1/jobs/{id}/cancel` (no body) to cancel a queued or running job.
+Repeated cancellation returns HTTP 200; completed and dead jobs return 409;
+unknown IDs return 404. The canceled state appears in `GET /v1/jobs/{id}`
+and the `canceled` count in `GET /v1/stats`.
+
+Canceling queued work prevents future claims. Canceling running work revokes
+the lease token and prevents stale renewals or acknowledgements; it does
+**not** forcibly terminate a process or guarantee that external effects stop.
+Handlers must cooperatively respect their context.
+
+The processor renews active leases every 2 seconds by default (configurable
+via `LeaseRenewInterval`). Keep this interval below the configured lease
+duration. Its 5-second default task timeout remains independent. On heartbeat
+loss, the processor cancels the handler context and skips acknowledgement.
+External effects remain at-least-once, never exactly-once.
+
+Migrations are tracked in `workflow_schema_migrations` with a PostgreSQL
+transaction advisory lock. Existing Phase 2 databases are adopted by replaying
+the idempotent initial schema migration before applying migration 002.
+
+Run `go test ./...`, `go test -race ./...`, `go vet ./...` and
+`make integration` against a dedicated `*_test` PostgreSQL database.
+See `docs/ADR-0003-lease-control.md` for failure boundaries.

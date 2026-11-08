@@ -20,6 +20,8 @@ type Store interface {
 	Claim(context.Context, string) (Lease, bool, error)
 	Complete(context.Context, string, string, json.RawMessage) error
 	Fail(context.Context, string, string, error) error
+	Renew(context.Context, string, string) error
+	Cancel(context.Context, string) (Job, error)
 	Ready(context.Context) error
 }
 
@@ -41,6 +43,8 @@ func (m MemoryStore) Fail(_ context.Context, id, t string, e error) error {
 	return m.Queue.Fail(id, t, e)
 }
 func (m MemoryStore) Ready(ctx context.Context) error { return ctx.Err() }
+func (m MemoryStore) Renew(_ context.Context, id, token string) error { return m.Queue.Renew(id, token) }
+func (m MemoryStore) Cancel(_ context.Context, id string) (Job, error) { return m.Queue.Cancel(id) }
 
 // NormalizeSubmission ensures both storage backends enforce identical validation
 // and canonical idempotency fingerprints. JSON object ordering is normalized.

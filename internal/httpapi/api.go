@@ -40,6 +40,7 @@ func (a *API) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /v1/jobs", a.create)
 	mux.HandleFunc("GET /v1/jobs/{id}", a.get)
+	mux.HandleFunc("POST /v1/jobs/{id}/cancel", a.cancel)
 	return mux
 }
 
@@ -122,4 +123,21 @@ func (a *API) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"jobs": list})
+}
+
+
+// cancel fences a queued or running job. This local-development API has no
+// authentication; do not expose the server publicly without an auth layer.
+func (a *API) cancel(w http.ResponseWriter, r *http.Request) {
+	job, err := a.Store.Cancel(r.Context(), r.PathValue("id"))
+	switch {
+	case errors.Is(err, jobs.ErrNotFound):
+		writeError(w, http.StatusNotFound, "job not found")
+	case errors.Is(err, jobs.ErrTerminal):
+		writeError(w, http.StatusConflict, "terminal job cannot be canceled")
+	case err != nil:
+		writeError(w, http.StatusServiceUnavailable, "storage unavailable")
+	default:
+		writeJSON(w, http.StatusOK, job)
+	}
 }
